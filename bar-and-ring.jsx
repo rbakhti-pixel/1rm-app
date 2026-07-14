@@ -99,14 +99,6 @@ function calc1RM(formulaId, g, r) {
   return f ? f.calc(g, r) : g;
 }
 
-// Every formula above is linear in g (weight), i.e. 1RM = g * factor(r).
-// Calling calc1RM with g=1 isolates that per-rep factor, which lets us
-// invert the relationship to go from "1RM for r reps" back to "weight
-// for r reps" without hand-deriving an inverse for each formula.
-function repFactor(formulaId, r) {
-  return calc1RM(formulaId, 1, r);
-}
-
 function roundWeight(w, unit) {
   const inc = unit === "lb" ? 2.5 : 1.25;
   return Math.round(w / inc) * inc;
@@ -128,7 +120,6 @@ function uid() {
 const KG_TO_LB = 2.20462;
 
 const DEFAULT_REMINDER_DAYS = 3;
-const REP_MAX_TABLE_MAX = 7;
 
 // Converts a %1RM into an added-weight number, rounded to the unit's
 // standard plate increment.
@@ -155,32 +146,6 @@ function getWarmupSets(targetAdded, unit) {
       weight: Math.max(0, roundWeight(weight, unit)),
     };
   });
-}
-
-// Builds the 1RM–7RM rep-max table for an exercise: for each rep count,
-// what added weight corresponds to that rep max, plus what % of the
-// exercise's current (added-weight) 1RM that works out to. Uses the
-// exercise's own formula (or the blended average) inverted via
-// repFactor, then re-applies bodyweight subtraction for bodyweight
-// exercises so every row lands in the same "added weight" terms as the
-// rest of the app.
-function getRepMaxTable(data, bodyweight, unit, maxReps = REP_MAX_TABLE_MAX) {
-  if (!data || !data.oneRM) return [];
-  const totalOneRM = data.totalOneRM != null ? data.totalOneRM : data.oneRM;
-  const bw = data.isBodyweight ? Number(bodyweight) || 0 : 0;
-  const rows = [];
-  for (let r = 1; r <= maxReps; r++) {
-    const factor = repFactor(data.formula, r);
-    if (!factor) continue;
-    const totalLoad = totalOneRM / factor;
-    const added = Math.max(0, roundWeight(totalLoad - bw, unit));
-    rows.push({
-      reps: r,
-      weight: added,
-      percent: weightToPercent(added, data.oneRM),
-    });
-  }
-  return rows;
 }
 
 /* ───────────────────────── tonnage / streak helpers ───────────────────────── */
@@ -539,33 +504,6 @@ const GlobalStyle = () => (
       border: 1px solid var(--border); cursor: pointer; background: transparent;
       transition: border-color 0.15s ease, background 0.15s ease;
     }
-    .slf-rmtable {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    .slf-rmtable th {
-      font-family: 'Space Mono', monospace;
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--steel);
-      text-align: left;
-      padding: 0 0 10px 0;
-      font-weight: 400;
-    }
-    .slf-rmtable th:not(:first-child), .slf-rmtable td:not(:first-child) {
-      text-align: right;
-    }
-    .slf-rmtable td {
-      font-family: 'Space Mono', monospace;
-      font-size: 13px;
-      padding: 9px 0;
-      border-top: 1px solid var(--border);
-    }
-    .slf-rmtable tr.active td {
-      color: var(--gold);
-      font-weight: 700;
-    }
   `}</style>
 );
 
@@ -731,54 +669,6 @@ function WarmupCard({ targetWeight, unit, isBodyweight }) {
           {isBodyweight ? " added" : ""}
         </span>
       </div>
-    </div>
-  );
-}
-
-// Rep-max reference table: for each rep count 1–7, the added weight that
-// hits that rep max and the equivalent % of current 1RM — mirrors the
-// classic "% / weight / rep max" chart, built from the exercise's own
-// formula so it stays consistent with everything else in the app.
-// activePercent highlights the row nearest the session's current %
-// selection so it reads as "here's roughly what you're about to do."
-function RepMaxTable({ data, bodyweight, unit, activePercent }) {
-  const rows = useMemo(() => getRepMaxTable(data, bodyweight, unit), [data, bodyweight, unit]);
-  if (rows.length === 0) return null;
-
-  let activeReps = null;
-  if (activePercent != null && rows.length) {
-    let best = rows[0];
-    for (const r of rows) {
-      if (Math.abs(r.percent - activePercent) < Math.abs(best.percent - activePercent)) best = r;
-    }
-    activeReps = best.reps;
-  }
-
-  return (
-    <div className="slf-card" style={{ marginTop: 16 }}>
-      <span className="slf-label" style={{ margin: 0, marginBottom: 12, display: "block" }}>
-        Rep max chart
-      </span>
-      <table className="slf-rmtable">
-        <thead>
-          <tr>
-            <th>RM</th>
-            <th>%</th>
-            <th>Weight</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.reps} className={r.reps === activeReps ? "active" : ""}>
-              <td>{r.reps}RM</td>
-              <td>{r.percent}%</td>
-              <td>
-                {fmt(r.weight)} {unit}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
     </div>
   );
 }
@@ -1309,7 +1199,6 @@ export default function StreetliftingApp() {
           name={params.name}
           data={exData[params.name]}
           unit={config.unit}
-          bodyweight={config.bodyweight}
           onBack={() => nav(params.from === "logPicker" ? "logPicker" : "exerciseDetail", { name: params.name })}
           onContinue={(sel) => nav("logSession", { name: params.name, from: params.from, ...sel })}
         />
@@ -1938,7 +1827,7 @@ function LogPicker({ exData, onPick, onAddExercise }) {
 
 /* ───────────────────────── Session Setup (category + %/weight picker) ───────────────────────── */
 
-function SessionSetup({ name, data, unit, bodyweight, onBack, onContinue }) {
+function SessionSetup({ name, data, unit, onBack, onContinue }) {
   const oneRM = data ? data.oneRM || 0 : 0;
   const [category, setCategory] = useState(null);
   const [percent, setPercent] = useState(80);
@@ -2010,8 +1899,6 @@ function SessionSetup({ name, data, unit, bodyweight, onBack, onContinue }) {
             of {fmt(oneRM)} {unit} 1RM
           </div>
         </div>
-
-        <RepMaxTable data={data} bodyweight={bodyweight} unit={unit} activePercent={percent} />
 
         <div className="slf-card" style={{ marginTop: 16 }}>
           <span className="slf-label">Or set the added weight directly ({unit})</span>
