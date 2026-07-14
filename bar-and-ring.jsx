@@ -16,6 +16,7 @@ import {
   BarChart3,
   Bell,
   BellOff,
+  Minus,
 } from "lucide-react";
 import {
   LineChart,
@@ -65,14 +66,28 @@ const FORMULAS = [
 ];
 
 // Warm-up ramp applied before every session's working sets, scaled off
-// that session's target weight (working weight for weeks 1-3, deload
-// weight for week 4). Percentages/reps follow a standard submax ramp:
-// a light activation set, a moderate set, then a set just under target.
+// the session's chosen target weight. Percentages/reps follow a standard
+// submax ramp: a light activation set, a moderate set, then a set just
+// under target.
 const WARMUP_SCHEME = [
   { pct: 0.5, reps: 6 },
   { pct: 0.65, reps: 4 },
   { pct: 0.8, reps: 3 },
 ];
+
+// Training-goal categories for the session %-picker. Selecting one seeds
+// the percentage stepper with the midpoint of its band; the stepper can
+// still be moved anywhere afterward since these are starting points, not
+// hard limits.
+const CATEGORIES = [
+  { id: "strength", label: "Strength", min: 85, max: 95, color: "var(--gold)" },
+  { id: "endurance", label: "Endurance", min: 65, max: 80, color: "var(--teal)" },
+  { id: "resistance", label: "Resistance", min: 20, max: 50, color: "var(--steel)" },
+];
+
+function categoryMidpoint(cat) {
+  return Math.round((cat.min + cat.max) / 2 / 5) * 5;
+}
 
 function calc1RM(formulaId, g, r) {
   if (!g || !r) return 0;
@@ -82,6 +97,14 @@ function calc1RM(formulaId, g, r) {
   }
   const f = FORMULAS.find((f) => f.id === formulaId);
   return f ? f.calc(g, r) : g;
+}
+
+// Every formula above is linear in g (weight), i.e. 1RM = g * factor(r).
+// Calling calc1RM with g=1 isolates that per-rep factor, which lets us
+// invert the relationship to go from "1RM for r reps" back to "weight
+// for r reps" without hand-deriving an inverse for each formula.
+function repFactor(formulaId, r) {
+  return calc1RM(formulaId, 1, r);
 }
 
 function roundWeight(w, unit) {
@@ -104,20 +127,26 @@ function uid() {
 
 const KG_TO_LB = 2.20462;
 
-// Default working-set and deload percentages applied to an exercise's
-// added-weight 1RM. These can be overridden per exercise in Settings —
-// useful since e.g. pull-ups (grip/lat limited) often need a lower
-// working % than dips (chest/tricep limited) for the same person.
-const DEFAULT_WORKING_PCT = 80;
-const DEFAULT_DELOAD_PCT = 40;
-const DEFAULT_REST_SECONDS = 120;
 const DEFAULT_REMINDER_DAYS = 3;
+const REP_MAX_TABLE_MAX = 7;
+
+// Converts a %1RM into an added-weight number, rounded to the unit's
+// standard plate increment.
+function percentToWeight(pct, oneRM, unit) {
+  return Math.max(0, roundWeight(((Number(pct) || 0) * (oneRM || 0)) / 100, unit));
+}
+
+// Converts an added-weight number back into a %1RM (whole number).
+function weightToPercent(weight, oneRM) {
+  if (!oneRM) return 0;
+  return Math.round((Number(weight) || 0) / oneRM * 100);
+}
 
 // Given a session's target ADDED weight, returns the 3-set warm-up ramp,
 // expressed as added weight only. Percentages are applied directly to
 // the added-weight target — simple and predictable.
-function getWarmupSets(targetAdded, unit, isBodyweight, bodyweight) {
-  if (targetAdded === undefined || targetAdded === null) return [];
+function getWarmupSets(targetAdded, unit) {
+  if (targetAdded === undefined || targetAdded === null || isNaN(targetAdded)) return [];
   return WARMUP_SCHEME.map((s, i) => {
     const weight = targetAdded * s.pct;
     return {
@@ -128,20 +157,30 @@ function getWarmupSets(targetAdded, unit, isBodyweight, bodyweight) {
   });
 }
 
-// Returns the full 4-week plan for an exercise: 3 progressive weeks at
-// the working weight (80% 1RM, set at test time), then a week-4 deload
-// at 40% of the current 1RM for 5x5. All weights are ADDED weight (what
-// goes on the belt/vest) — percentages are applied directly to the
-// added-weight 1RM.
-function getWeekPlan(data, unit, bodyweight) {
-  const deloadPct = data.deloadPct != null ? data.deloadPct : DEFAULT_DELOAD_PCT;
-  const deloadWeight = roundWeight((data.oneRM || 0) * (deloadPct / 100), unit);
-  return [
-    { week: 1, sets: 5, reps: 3, weight: data.workingWeight, isDeload: false },
-    { week: 2, sets: 5, reps: 4, weight: data.workingWeight, isDeload: false },
-    { week: 3, sets: 5, reps: 5, weight: data.workingWeight, isDeload: false },
-    { week: 4, sets: 5, reps: 5, weight: deloadWeight, isDeload: true },
-  ];
+// Builds the 1RM–7RM rep-max table for an exercise: for each rep count,
+// what added weight corresponds to that rep max, plus what % of the
+// exercise's current (added-weight) 1RM that works out to. Uses the
+// exercise's own formula (or the blended average) inverted via
+// repFactor, then re-applies bodyweight subtraction for bodyweight
+// exercises so every row lands in the same "added weight" terms as the
+// rest of the app.
+function getRepMaxTable(data, bodyweight, unit, maxReps = REP_MAX_TABLE_MAX) {
+  if (!data || !data.oneRM) return [];
+  const totalOneRM = data.totalOneRM != null ? data.totalOneRM : data.oneRM;
+  const bw = data.isBodyweight ? Number(bodyweight) || 0 : 0;
+  const rows = [];
+  for (let r = 1; r <= maxReps; r++) {
+    const factor = repFactor(data.formula, r);
+    if (!factor) continue;
+    const totalLoad = totalOneRM / factor;
+    const added = Math.max(0, roundWeight(totalLoad - bw, unit));
+    rows.push({
+      reps: r,
+      weight: added,
+      percent: weightToPercent(added, data.oneRM),
+    });
+  }
+  return rows;
 }
 
 /* ───────────────────────── tonnage / streak helpers ───────────────────────── */
@@ -346,10 +385,11 @@ const GlobalStyle = () => (
     }
 
     .slf-card {
-      background: var(--card);
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0) 40%), var(--card);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 18px;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.25);
     }
     .slf-btn {
       font-family: 'Inter', sans-serif;
@@ -406,7 +446,7 @@ const GlobalStyle = () => (
     .slf-navbar {
       position: absolute;
       bottom: 0; left: 0; right: 0;
-      background: rgba(22,38,59,0.92);
+      background: rgba(21,19,16,0.92);
       backdrop-filter: blur(8px);
       border-top: 1px solid var(--border);
       display: flex;
@@ -439,22 +479,22 @@ const GlobalStyle = () => (
     }
     .slf-chip.gold { color: var(--gold); border-color: var(--gold); }
     .slf-chip.teal { color: var(--teal); border-color: var(--teal); }
-    .slf-divider { height: 1px; background: var(--border); border: none; margin: 16px 0; }
+    .slf-divider { height: 1px; background: var(--border); border: none; margin: 18px 0; }
     .slf-exlist-item {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 15px; border-radius: 12px; border: 1px solid var(--border);
+      padding: 16px; border-radius: 14px; border: 1px solid var(--border);
       background: var(--card); cursor: pointer; margin-bottom: 10px;
-      transition: border-color 0.15s ease;
+      transition: border-color 0.15s ease, transform 0.15s ease;
     }
-    .slf-exlist-item:active { border-color: var(--gold); }
+    .slf-exlist-item:active { border-color: var(--gold); transform: scale(0.99); }
     .slf-modal-overlay {
-      position: absolute; inset: 0; background: rgba(15,27,43,0.7);
+      position: absolute; inset: 0; background: rgba(6,6,6,0.75);
       display: flex; align-items: flex-end; z-index: 20;
       max-width: 480px; margin: 0 auto;
     }
     .slf-modal {
       background: var(--card); border: 1px solid var(--border);
-      border-radius: 18px 18px 0 0; padding: 22px 20px calc(22px + env(safe-area-inset-bottom));
+      border-radius: 20px 20px 0 0; padding: 22px 20px calc(22px + env(safe-area-inset-bottom));
       width: 100%; max-height: 85vh; overflow-y: auto;
     }
     .slf-heat-grid {
@@ -478,8 +518,53 @@ const GlobalStyle = () => (
     .slf-banner {
       display: flex; align-items: center; gap: 12px;
       border-radius: 14px; border: 1px solid var(--gold);
-      background: rgba(201,165,78,0.1); padding: 14px 16px;
+      background: rgba(255,204,0,0.08); padding: 14px 16px;
       margin-bottom: 16px;
+    }
+    .slf-hero {
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      background: radial-gradient(120% 140% at 20% -10%, rgba(255,204,0,0.14), transparent 55%), var(--card);
+      padding: 30px 20px;
+    }
+    .slf-stepper-btn {
+      width: 44px; height: 44px; border-radius: 12px;
+      display: flex; align-items: center; justify-content: center;
+      background: transparent; border: 1px solid var(--border); color: var(--text);
+      cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .slf-stepper-btn:active { background: rgba(255,204,0,0.12); border-color: var(--gold); }
+    .slf-cat-chip {
+      flex: 1; padding: 14px 10px; border-radius: 14px; text-align: center;
+      border: 1px solid var(--border); cursor: pointer; background: transparent;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .slf-rmtable {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .slf-rmtable th {
+      font-family: 'Space Mono', monospace;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--steel);
+      text-align: left;
+      padding: 0 0 10px 0;
+      font-weight: 400;
+    }
+    .slf-rmtable th:not(:first-child), .slf-rmtable td:not(:first-child) {
+      text-align: right;
+    }
+    .slf-rmtable td {
+      font-family: 'Space Mono', monospace;
+      font-size: 13px;
+      padding: 9px 0;
+      border-top: 1px solid var(--border);
+    }
+    .slf-rmtable tr.active td {
+      color: var(--gold);
+      font-weight: 700;
     }
   `}</style>
 );
@@ -594,8 +679,8 @@ function EmptyState({ icon, title, sub, action, onAction }) {
 }
 
 // Shows the 3-set warm-up ramp leading into a session's working sets.
-function WarmupCard({ targetWeight, unit, isBodyweight, bodyweight }) {
-  const sets = getWarmupSets(targetWeight, unit, isBodyweight, bodyweight);
+function WarmupCard({ targetWeight, unit, isBodyweight }) {
+  const sets = getWarmupSets(targetWeight, unit);
   if (sets.length === 0) return null;
   return (
     <div className="slf-card" style={{ marginBottom: 14 }}>
@@ -650,172 +735,53 @@ function WarmupCard({ targetWeight, unit, isBodyweight, bodyweight }) {
   );
 }
 
-// Short two-tone beep played when the rest timer hits zero. Falls back
-// silently if the Web Audio API isn't available.
-function useBeep() {
-  const ctxRef = useRef(null);
-  return useCallback(() => {
-    try {
-      if (!ctxRef.current) {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        ctxRef.current = new AudioCtx();
-      }
-      const ctx = ctxRef.current;
-      if (ctx.state === "suspended") ctx.resume();
-      const playTone = (freq, start, dur) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        gain.gain.setValueAtTime(0.0001, ctx.currentTime + start);
-        gain.gain.exponentialRampToValueAtTime(0.3, ctx.currentTime + start + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + start + dur);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(ctx.currentTime + start);
-        osc.stop(ctx.currentTime + start + dur + 0.05);
-      };
-      playTone(880, 0, 0.15);
-      playTone(1108, 0.18, 0.22);
-    } catch (e) {
-      /* audio unavailable, fail silently */
+// Rep-max reference table: for each rep count 1–7, the added weight that
+// hits that rep max and the equivalent % of current 1RM — mirrors the
+// classic "% / weight / rep max" chart, built from the exercise's own
+// formula so it stays consistent with everything else in the app.
+// activePercent highlights the row nearest the session's current %
+// selection so it reads as "here's roughly what you're about to do."
+function RepMaxTable({ data, bodyweight, unit, activePercent }) {
+  const rows = useMemo(() => getRepMaxTable(data, bodyweight, unit), [data, bodyweight, unit]);
+  if (rows.length === 0) return null;
+
+  let activeReps = null;
+  if (activePercent != null && rows.length) {
+    let best = rows[0];
+    for (const r of rows) {
+      if (Math.abs(r.percent - activePercent) < Math.abs(best.percent - activePercent)) best = r;
     }
-  }, []);
-}
-
-// Rest timer that auto-starts whenever `triggerKey` changes (i.e. whenever
-// the parent marks a set as done). Counts down, beeps + vibrates at zero.
-// Duration can be nudged +/-15s per use without touching the saved default.
-function RestTimer({ defaultSeconds, triggerKey }) {
-  const [duration, setDuration] = useState(defaultSeconds);
-  const [timeLeft, setTimeLeft] = useState(defaultSeconds);
-  const [running, setRunning] = useState(false);
-  const [done, setDone] = useState(false);
-  const beep = useBeep();
-  const firstRun = useRef(true);
-
-  useEffect(() => {
-    if (!running && !done) {
-      setDuration(defaultSeconds);
-      setTimeLeft(defaultSeconds);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [defaultSeconds]);
-
-  useEffect(() => {
-    if (firstRun.current) {
-      firstRun.current = false;
-      return;
-    }
-    setTimeLeft(duration);
-    setRunning(true);
-    setDone(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [triggerKey]);
-
-  useEffect(() => {
-    if (!running) return;
-    if (timeLeft <= 0) {
-      setRunning(false);
-      setDone(true);
-      beep();
-      if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
-      return;
-    }
-    const t = setTimeout(() => setTimeLeft((s) => s - 1), 1000);
-    return () => clearTimeout(t);
-  }, [running, timeLeft, beep]);
-
-  const adjust = (delta) => {
-    setDuration((d) => Math.max(15, d + delta));
-    if (!running) setTimeLeft((t) => Math.max(0, t + delta));
-  };
-  const start = () => {
-    setTimeLeft(duration);
-    setRunning(true);
-    setDone(false);
-  };
-  const pause = () => setRunning(false);
-  const resume = () => {
-    if (timeLeft > 0) setRunning(true);
-  };
-  const skip = () => {
-    setRunning(false);
-    setTimeLeft(0);
-    setDone(true);
-  };
-  const reset = () => {
-    setRunning(false);
-    setTimeLeft(duration);
-    setDone(false);
-  };
-
-  const mm = Math.floor(timeLeft / 60);
-  const ss = timeLeft % 60;
-  const paused = !running && !done && timeLeft < duration && timeLeft > 0;
+    activeReps = best.reps;
+  }
 
   return (
-    <div
-      className="slf-card"
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 16,
-        marginBottom: 14,
-        borderColor: done ? "var(--teal)" : running ? "var(--gold)" : "var(--border)",
-      }}
-    >
-      <Gauge
-        value={duration - timeLeft}
-        max={duration}
-        size={62}
-        strokeWidth={6}
-        color={done ? "var(--teal)" : "var(--gold)"}
-        centerBig={`${mm}:${String(ss).padStart(2, "0")}`}
-      />
-      <div style={{ flex: 1 }}>
-        <div className="slf-label" style={{ margin: 0, marginBottom: 8 }}>
-          {done ? "Rest done — go" : running ? "Resting…" : "Rest timer"}
-        </div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <button className="slf-btn slf-btn-ghost" style={{ padding: "6px 10px", fontSize: 11 }} onClick={() => adjust(-15)}>
-            −15s
-          </button>
-          <button className="slf-btn slf-btn-ghost" style={{ padding: "6px 10px", fontSize: 11 }} onClick={() => adjust(15)}>
-            +15s
-          </button>
-          {!running && !done && !paused && (
-            <button className="slf-btn slf-btn-teal" style={{ padding: "6px 12px", fontSize: 11 }} onClick={start}>
-              Start
-            </button>
-          )}
-          {running && (
-            <button className="slf-btn slf-btn-ghost" style={{ padding: "6px 12px", fontSize: 11 }} onClick={pause}>
-              Pause
-            </button>
-          )}
-          {paused && (
-            <button className="slf-btn slf-btn-teal" style={{ padding: "6px 12px", fontSize: 11 }} onClick={resume}>
-              Resume
-            </button>
-          )}
-          {(running || paused) && (
-            <button className="slf-btn slf-btn-ghost" style={{ padding: "6px 12px", fontSize: 11 }} onClick={skip}>
-              Skip
-            </button>
-          )}
-          {done && (
-            <button className="slf-btn slf-btn-ghost" style={{ padding: "6px 12px", fontSize: 11 }} onClick={reset}>
-              Reset
-            </button>
-          )}
-        </div>
-      </div>
+    <div className="slf-card" style={{ marginTop: 16 }}>
+      <span className="slf-label" style={{ margin: 0, marginBottom: 12, display: "block" }}>
+        Rep max chart
+      </span>
+      <table className="slf-rmtable">
+        <thead>
+          <tr>
+            <th>RM</th>
+            <th>%</th>
+            <th>Weight</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.reps} className={r.reps === activeReps ? "active" : ""}>
+              <td>{r.reps}RM</td>
+              <td>{r.percent}%</td>
+              <td>
+                {fmt(r.weight)} {unit}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
-
-
 
 /* ───────────────────────── streak / calendar / tonnage widgets ───────────────────────── */
 
@@ -834,7 +800,7 @@ function StreakBadge({ current, best, size = "normal" }) {
           width: big ? 56 : 40,
           height: big ? 56 : 40,
           borderRadius: "50%",
-          background: current > 0 ? "rgba(201,165,78,0.15)" : "var(--card)",
+          background: current > 0 ? "rgba(255,204,0,0.15)" : "var(--card)",
           border: `1px solid ${current > 0 ? "var(--gold)" : "var(--border)"}`,
           display: "flex",
           alignItems: "center",
@@ -1032,11 +998,9 @@ export default function StreetliftingApp() {
   // The 1RM formula still runs on TOTAL load (bodyweight + added) for
   // bodyweight exercises, since that's the load your body actually moves
   // at failure — that part is unavoidable for an accurate 1RM estimate.
-  // But the 80%/40% working percentages are then applied directly to the
-  // resulting added-weight 1RM (not to the total), so a 20% cut is always
-  // a 20% cut off the number you actually see, instead of being able to
-  // wipe out almost all of your added weight when bodyweight is most of
-  // your total load.
+  // The resulting number is always added-weight-only 1RM (bodyweight
+  // subtracted back out), which every %-of-1RM calculation elsewhere in
+  // the app is based on.
   const submitTest = useCallback(
     async ({ name, isBodyweight, formulaId, weightInput, reps, isNew, bodyweightInput }) => {
       let cfg = config;
@@ -1048,12 +1012,6 @@ export default function StreetliftingApp() {
       const totalInput = isBodyweight ? g + bodyweight : g;
       const totalOneRM = calc1RM(formulaId, totalInput, Number(reps));
       const oneRM = isBodyweight ? Math.max(0, totalOneRM - bodyweight) : totalOneRM;
-      const existing = exData[name];
-      // Keep this exercise's own working/deload % across retests; default
-      // to 80%/40% the first time it's set up.
-      const workingPct = existing && existing.workingPct != null ? existing.workingPct : DEFAULT_WORKING_PCT;
-      const deloadPct = existing && existing.deloadPct != null ? existing.deloadPct : DEFAULT_DELOAD_PCT;
-      const workingWeight = roundWeight(oneRM * (workingPct / 100), cfg.unit || "kg");
       const test = {
         id: uid(),
         date: todayStr(),
@@ -1069,16 +1027,10 @@ export default function StreetliftingApp() {
           name,
           isBodyweight,
           formula: formulaId,
-          block: 1,
-          week: 1,
           oneRM,
           totalOneRM,
-          workingPct,
-          deloadPct,
-          workingWeight,
           tests: [test],
           sessions: [],
-          needsRetest: false,
         };
         const nextList = Array.from(new Set([...(cfg.exercisesList || []), name]));
         cfg = { ...cfg, exercisesList: nextList, onboarded: true };
@@ -1087,49 +1039,38 @@ export default function StreetliftingApp() {
         data = {
           ...data,
           formula: formulaId,
-          block: (data.block || 1) + 1,
-          week: 1,
           oneRM,
           totalOneRM,
-          workingPct,
-          deloadPct,
-          workingWeight,
           tests: [...data.tests, { ...test }],
-          needsRetest: false,
         };
         if (bodyweightInput) {
           await persistConfig(cfg);
         }
       }
       await persistExercise(name, data);
-      nav("testResult", { name, result: oneRM, workingWeight, workingPct, isBodyweight });
+      nav("testResult", { name, result: oneRM, isBodyweight });
     },
     [config, exData, persistConfig, persistExercise, nav]
   );
 
   const logSession = useCallback(
-    async ({ name, weightUsed, setsCompleted, repsCompleted, rpe, notes }) => {
+    async ({ name, category, percent, weightUsed, setsCompleted, repsCompleted, rpe, notes }) => {
       const data = exData[name];
       if (!data) return;
       const session = {
         id: uid(),
         date: todayStr(),
-        block: data.block,
-        week: data.week,
+        category: category || null,
+        percent: percent != null ? Number(percent) : null,
         weightUsed: Number(weightUsed),
         setsCompleted: Number(setsCompleted),
         repsCompleted: Number(repsCompleted),
         rpe: rpe === "" ? null : Number(rpe),
         notes: notes || "",
       };
-      // Weeks 1-3 are the progressive block, week 4 is the deload.
-      // After week 4 is logged, a retest is required to start the next block.
-      const nextWeek = data.week < 4 ? data.week + 1 : data.week;
       const nextData = {
         ...data,
         sessions: [...data.sessions, session],
-        week: nextWeek,
-        needsRetest: data.week >= 4 ? true : data.needsRetest,
       };
       await persistExercise(name, nextData);
       nav("exerciseDetail", { name });
@@ -1159,15 +1100,6 @@ export default function StreetliftingApp() {
     [exData, persistExercise]
   );
 
-  const restartWave = useCallback(
-    async (name) => {
-      const data = exData[name];
-      if (!data) return;
-      await persistExercise(name, { ...data, week: 1, needsRetest: false });
-    },
-    [exData, persistExercise]
-  );
-
   const updateFormulaOverride = useCallback(
     async (name, formulaId) => {
       const data = exData[name];
@@ -1177,28 +1109,9 @@ export default function StreetliftingApp() {
     [exData, persistExercise]
   );
 
-  const updateWorkingPct = useCallback(
-    async (name, workingPct, deloadPct) => {
-      const data = exData[name];
-      if (!data) return;
-      const wp = workingPct != null ? Number(workingPct) : (data.workingPct != null ? data.workingPct : DEFAULT_WORKING_PCT);
-      const dp = deloadPct != null ? Number(deloadPct) : (data.deloadPct != null ? data.deloadPct : DEFAULT_DELOAD_PCT);
-      const workingWeight = roundWeight((data.oneRM || 0) * (wp / 100), config.unit || "kg");
-      await persistExercise(name, { ...data, workingPct: wp, deloadPct: dp, workingWeight });
-    },
-    [exData, config, persistExercise]
-  );
-
   const updateBodyweight = useCallback(
     async (bw) => {
       await persistConfig({ ...config, bodyweight: Number(bw) });
-    },
-    [config, persistConfig]
-  );
-
-  const updateRestSeconds = useCallback(
-    async (sec) => {
-      await persistConfig({ ...config, restSeconds: Math.max(15, Number(sec) || DEFAULT_REST_SECONDS) });
     },
     [config, persistConfig]
   );
@@ -1266,12 +1179,9 @@ export default function StreetliftingApp() {
     for (const [name, data] of Object.entries(exData)) {
       const conv = (v) => (v === null || v === undefined ? v : Math.round(v * factor * 100) / 100);
       const oneRM = conv(data.oneRM);
-      const workingPct = data.workingPct != null ? data.workingPct : DEFAULT_WORKING_PCT;
-      const workingWeight = roundWeight(oneRM * (workingPct / 100), nextUnit);
       const next = {
         ...data,
         oneRM,
-        workingWeight,
         tests: data.tests.map((t) => ({
           ...t,
           weightInput: conv(t.weightInput),
@@ -1348,8 +1258,6 @@ export default function StreetliftingApp() {
         <TestResult
           name={params.name}
           result={params.result}
-          workingWeight={params.workingWeight}
-          workingPct={params.workingPct}
           unit={config.unit}
           isBodyweight={params.isBodyweight}
           onContinue={() => nav("exerciseDetail", { name: params.name })}
@@ -1372,9 +1280,8 @@ export default function StreetliftingApp() {
           name={params.name}
           data={exData[params.name]}
           unit={config.unit}
-          bodyweight={config.bodyweight}
           onBack={() => nav("dashboard")}
-          onLog={() => nav("logSession", { name: params.name })}
+          onStartSession={() => nav("sessionSetup", { name: params.name })}
           onRetest={() =>
             nav("testInput", {
               name: params.name,
@@ -1392,8 +1299,19 @@ export default function StreetliftingApp() {
       {screen === "logPicker" && (
         <LogPicker
           exData={exData}
-          onPick={(name) => nav("logSession", { name, from: "logPicker" })}
+          onPick={(name) => nav("sessionSetup", { name, from: "logPicker" })}
           onAddExercise={() => nav("exercisePicker", { isNew: true })}
+        />
+      )}
+
+      {screen === "sessionSetup" && (
+        <SessionSetup
+          name={params.name}
+          data={exData[params.name]}
+          unit={config.unit}
+          bodyweight={config.bodyweight}
+          onBack={() => nav(params.from === "logPicker" ? "logPicker" : "exerciseDetail", { name: params.name })}
+          onContinue={(sel) => nav("logSession", { name: params.name, from: params.from, ...sel })}
         />
       )}
 
@@ -1402,9 +1320,10 @@ export default function StreetliftingApp() {
           name={params.name}
           data={exData[params.name]}
           unit={config.unit}
-          bodyweight={config.bodyweight}
-          restSeconds={config.restSeconds || DEFAULT_REST_SECONDS}
-          onBack={() => nav(params.from === "logPicker" ? "logPicker" : "exerciseDetail", { name: params.name })}
+          category={params.category}
+          percent={params.percent}
+          weight={params.weight}
+          onBack={() => nav("sessionSetup", { name: params.name, from: params.from })}
           onSubmit={logSession}
         />
       )}
@@ -1427,11 +1346,8 @@ export default function StreetliftingApp() {
           config={config}
           exData={exData}
           onSaveBodyweight={updateBodyweight}
-          onSaveRestSeconds={updateRestSeconds}
           onToggleUnit={toggleUnit}
           onFormulaOverride={updateFormulaOverride}
-          onWorkingPctOverride={updateWorkingPct}
-          onRestartWave={restartWave}
           onRemoveExercise={removeExercise}
           onAddExercise={() => nav("exercisePicker", { isNew: true })}
           onSaveReminderDays={updateReminderDays}
@@ -1440,7 +1356,7 @@ export default function StreetliftingApp() {
         />
       )}
 
-      {onboarded && ["dashboard", "exerciseDetail", "logSession", "logPicker", "history", "stats", "settings"].includes(screen) && (
+      {onboarded && ["dashboard", "exerciseDetail", "sessionSetup", "logSession", "logPicker", "history", "stats", "settings"].includes(screen) && (
         <BottomNav screen={screen} onNav={nav} />
       )}
     </div>
@@ -1462,21 +1378,21 @@ function Welcome({ onBegin }) {
         justifyContent: "center",
         padding: "40px 32px",
         textAlign: "center",
-        gap: 22,
+        gap: 24,
       }}
     >
-      <div style={{ position: "relative", width: 140, height: 140 }}>
-        <Gauge value={0.72} max={1} size={140} strokeWidth={10} />
+      <div style={{ position: "relative", width: 150, height: 150 }}>
+        <Gauge value={0.72} max={1} size={150} strokeWidth={10} />
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <Dumbbell size={40} color="var(--gold)" strokeWidth={1.5} />
+          <Dumbbell size={42} color="var(--gold)" strokeWidth={1.5} />
         </div>
       </div>
-      <div style={{ marginTop: 10 }}>
-        <h1 className="slf-display" style={{ fontSize: 34, marginBottom: 10, letterSpacing: -0.5 }}>
+      <div style={{ marginTop: 6 }}>
+        <h1 className="slf-display" style={{ fontSize: 38, marginBottom: 12, letterSpacing: -0.5, lineHeight: 1.02 }}>
           BAR &amp; RING
         </h1>
         <p style={{ color: "var(--steel)", fontSize: 14, lineHeight: 1.5, maxWidth: 280 }}>
-          Wave-loaded strength training for pull-ups, dips, squat and bench. Test your max, work the wave, retest.
+          Strength training for pull-ups, dips, squat and bench. Test your max, pick your %, get after it.
         </p>
       </div>
       <div style={{ width: "100%" }}>
@@ -1756,7 +1672,7 @@ function TestInput({ name, isBodyweight, formulaId, isNew, config, onSubmit, onB
   );
 }
 
-function TestResult({ name, result, workingWeight, workingPct, unit, isBodyweight, onContinue, onAddAnother }) {
+function TestResult({ name, result, unit, isBodyweight, onContinue, onAddAnother }) {
   return (
     <div
       className="slf-fade"
@@ -1777,11 +1693,11 @@ function TestResult({ name, result, workingWeight, workingPct, unit, isBodyweigh
         )}
       </div>
       <p style={{ color: "var(--steel)", fontSize: 13, maxWidth: 280 }}>
-        A 4-week block has been generated: 3 weeks at {workingPct != null ? workingPct : 80}% of this max — {fmt(workingWeight)} {unit} — followed by a deload week.
+        Ready to log a session — pick a training category and percentage, or set a weight directly.
       </p>
       <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
         <button className="slf-btn slf-btn-primary" onClick={onContinue}>
-          View wave plan
+          Go to exercise
         </button>
         <button className="slf-btn slf-btn-ghost" onClick={onAddAnother}>
           Set up another lift
@@ -1814,7 +1730,7 @@ function Dashboard({ config, exData, onOpenExercise, onAddExercise, onOpenStats 
           <EmptyState
             icon={<Dumbbell size={32} />}
             title="No lifts yet"
-            sub="Add your first lift to run a 1RM test and generate a wave."
+            sub="Add your first lift to run a 1RM test."
             action="Add your first lift"
             onAction={onAddExercise}
           />
@@ -1828,7 +1744,7 @@ function Dashboard({ config, exData, onOpenExercise, onAddExercise, onOpenStats 
       <TopBar title="Dashboard" />
       <div className="slf-scroll">
         {config.userName && (
-          <div className="slf-display" style={{ fontSize: 18, marginBottom: 16 }}>
+          <div className="slf-display" style={{ fontSize: 19, marginBottom: 16 }}>
             Hi {config.userName}, keep going
           </div>
         )}
@@ -1840,16 +1756,16 @@ function Dashboard({ config, exData, onOpenExercise, onAddExercise, onOpenStats 
           <ChevronRight size={18} color="var(--steel)" />
         </div>
 
-        <div className="slf-card" style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "28px 16px" }}>
+        <div className="slf-hero" style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "32px 16px" }}>
           <Gauge
             value={mainPresent.length}
             max={4}
-            size={168}
+            size={172}
             strokeWidth={12}
             centerBig={fmt(currentTotal)}
             centerSmall={`TOTAL · ${config.unit}`}
           />
-          <div style={{ marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
+          <div style={{ marginTop: 16, display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
             {mainPresent.length >= 2 && baselineTotal > 0 && (
               <span className={`slf-chip ${pctChange >= 0 ? "teal" : ""}`}>
                 {pctChange >= 0 ? "+" : ""}
@@ -1860,7 +1776,7 @@ function Dashboard({ config, exData, onOpenExercise, onAddExercise, onOpenStats 
           </div>
         </div>
 
-        <div style={{ marginTop: 22, marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ marginTop: 24, marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <span className="slf-label" style={{ margin: 0 }}>
             Your lifts
           </span>
@@ -1882,22 +1798,15 @@ function Dashboard({ config, exData, onOpenExercise, onAddExercise, onOpenStats 
 }
 
 function ExerciseCard({ data, unit, onClick }) {
+  const lastSession = data.sessions.length ? data.sessions[data.sessions.length - 1] : null;
   return (
     <div className="slf-exlist-item" style={{ alignItems: "center" }} onClick={onClick}>
       <div style={{ flex: 1 }}>
         <div style={{ fontWeight: 700, fontSize: 15 }}>{data.name}</div>
         <div className="slf-mono" style={{ fontSize: 11, color: "var(--steel)", marginTop: 4 }}>
-          Block {data.block} · Week {data.week} of 4{data.week === 4 ? " · Deload" : ""}
+          {data.sessions.length} session{data.sessions.length === 1 ? "" : "s"} logged
         </div>
         <div style={{ display: "flex", gap: 14, marginTop: 8 }}>
-          <div>
-            <div className="slf-mono" style={{ fontSize: 10, color: "var(--steel)" }}>
-              WORKING
-            </div>
-            <div style={{ fontWeight: 700, fontSize: 13 }}>
-              {fmt(data.workingWeight)} {unit}
-            </div>
-          </div>
           <div>
             <div className="slf-mono" style={{ fontSize: 10, color: "var(--steel)" }}>
               1RM
@@ -1906,108 +1815,62 @@ function ExerciseCard({ data, unit, onClick }) {
               {fmt(data.oneRM)} {unit}
             </div>
           </div>
+          {lastSession && (
+            <div>
+              <div className="slf-mono" style={{ fontSize: 10, color: "var(--steel)" }}>
+                LAST SESSION
+              </div>
+              <div style={{ fontWeight: 700, fontSize: 13 }}>
+                {fmt(lastSession.weightUsed)} {unit}
+                {lastSession.percent != null ? ` · ${lastSession.percent}%` : ""}
+              </div>
+            </div>
+          )}
         </div>
-        {data.needsRetest && (
-          <div className="slf-chip teal" style={{ marginTop: 10 }}>
-            Wave complete · retest ready
-          </div>
-        )}
       </div>
-      <Gauge value={data.needsRetest ? 4 : data.week} max={4} size={46} strokeWidth={5} color={data.needsRetest ? "var(--teal)" : "var(--gold)"} />
+      <ChevronRight size={18} color="var(--steel)" />
     </div>
   );
 }
 
 /* ───────────────────────── Exercise Detail ───────────────────────── */
 
-function ExerciseDetail({ name, data, unit, bodyweight, onBack, onLog, onRetest, onDeleteTest, onDeleteSession, onEditSession }) {
+function ExerciseDetail({ name, data, unit, onBack, onStartSession, onRetest, onDeleteTest, onDeleteSession, onEditSession }) {
   if (!data) return null;
 
   const chartData = data.tests.map((t, i) => ({
-    label: `B${t.block || i + 1}`,
+    label: `T${i + 1}`,
     value: Math.round(t.result * 10) / 10,
     date: t.date,
   }));
-
-  const weekPlan = getWeekPlan(data, unit, bodyweight);
-  const currentWeekDef = weekPlan.find((w) => w.week === data.week) || weekPlan[0];
 
   return (
     <div className="slf-fade">
       <TopBar title={name} onBack={onBack} />
       <div className="slf-scroll">
-        <div className="slf-card" style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <Gauge value={data.needsRetest ? 4 : data.week} max={4} size={80} strokeWidth={8} centerBig={data.week} centerSmall="WK" />
+        <div className="slf-hero" style={{ display: "flex", alignItems: "center", gap: 18 }}>
+          <Gauge value={1} max={1} size={86} strokeWidth={8} color="var(--gold)" centerBig={fmt(data.oneRM)} centerSmall={unit} />
           <div>
             <div className="slf-mono" style={{ fontSize: 11, color: "var(--steel)" }}>
-              BLOCK {data.block}
+              CURRENT 1RM
             </div>
             <div className="slf-display" style={{ fontSize: 20 }}>
               {fmt(data.oneRM)} {unit}
             </div>
             <div style={{ fontSize: 12, color: "var(--steel)" }}>
-              current 1RM{data.isBodyweight ? " (added weight)" : ""}
+              {data.isBodyweight ? "added weight" : "barbell weight"} · {data.tests.length} test{data.tests.length === 1 ? "" : "s"}
             </div>
           </div>
         </div>
 
-        {data.needsRetest ? (
-          <div className="slf-card" style={{ marginTop: 14, borderColor: "var(--teal)" }}>
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>Wave complete</div>
-            <p style={{ color: "var(--steel)", fontSize: 13, marginBottom: 14 }}>
-              You've logged all four weeks of this block, including the deload. Run a new 1RM test to generate the next wave.
-            </p>
-            <button className="slf-btn slf-btn-teal" style={{ width: "100%" }} onClick={onRetest}>
-              Start new 1RM test
-            </button>
-          </div>
-        ) : (
-          <>
-            <div style={{ margin: "20px 0 10px" }}>
-              <span className="slf-label" style={{ margin: 0 }}>
-                {currentWeekDef.isDeload ? "Deload week" : "Wave plan"} · {fmt(currentWeekDef.weight)} {unit}
-                {data.isBodyweight ? " added" : ""}
-              </span>
-            </div>
-
-            <WarmupCard targetWeight={currentWeekDef.weight} unit={unit} isBodyweight={data.isBodyweight} bodyweight={bodyweight} />
-
-            {weekPlan.map((w) => {
-              const state = w.week < data.week ? "done" : w.week === data.week ? "current" : "upcoming";
-              return (
-                <div
-                  key={w.week}
-                  className="slf-card"
-                  style={{
-                    marginBottom: 10,
-                    opacity: state === "upcoming" ? 0.5 : 1,
-                    borderColor: state === "current" ? "var(--gold)" : "var(--border)",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                  }}
-                >
-                  <div>
-                    <div style={{ fontWeight: 700, fontSize: 14 }}>
-                      Week {w.week}
-                      {w.isDeload ? " · Deload" : ""}
-                    </div>
-                    <div className="slf-mono" style={{ fontSize: 12, color: "var(--steel)", marginTop: 3 }}>
-                      {w.sets} × {w.reps} @ {fmt(w.weight)} {unit}
-                      {data.isBodyweight ? " added" : ""}
-                    </div>
-                  </div>
-                  {state === "done" && <Check size={18} color="var(--teal)" />}
-                  {state === "current" && (
-                    <button className="slf-btn slf-btn-primary" style={{ padding: "9px 14px", fontSize: 12 }} onClick={onLog}>
-                      Log session
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </>
-        )}
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <button className="slf-btn slf-btn-primary" style={{ flex: 1 }} onClick={onStartSession}>
+            Log a session
+          </button>
+          <button className="slf-btn slf-btn-ghost" style={{ flex: 1 }} onClick={onRetest}>
+            Retest 1RM
+          </button>
+        </div>
 
         {chartData.length > 1 && (
           <div style={{ marginTop: 24 }}>
@@ -2057,14 +1920,14 @@ function LogPicker({ exData, onPick, onAddExercise }) {
         {names.map((n) => {
           const d = exData[n];
           return (
-            <div key={n} className="slf-exlist-item" onClick={() => !d.needsRetest && onPick(n)} style={{ opacity: d.needsRetest ? 0.5 : 1, cursor: d.needsRetest ? "default" : "pointer" }}>
+            <div key={n} className="slf-exlist-item" onClick={() => onPick(n)}>
               <div>
                 <div style={{ fontWeight: 700, fontSize: 15 }}>{n}</div>
                 <div className="slf-mono" style={{ fontSize: 11, color: "var(--steel)", marginTop: 3 }}>
-                  {d.needsRetest ? "retest required — see exercise detail" : `Block ${d.block} · Week ${d.week} of 4${d.week === 4 ? " · Deload" : ""}`}
+                  1RM {fmt(d.oneRM)}
                 </div>
               </div>
-              {!d.needsRetest && <ChevronRight size={18} color="var(--steel)" />}
+              <ChevronRight size={18} color="var(--steel)" />
             </div>
           );
         })}
@@ -2073,41 +1936,140 @@ function LogPicker({ exData, onPick, onAddExercise }) {
   );
 }
 
-/* ───────────────────────── Log Session ───────────────────────── */
+/* ───────────────────────── Session Setup (category + %/weight picker) ───────────────────────── */
 
-function LogSession({ name, data, unit, bodyweight, restSeconds, onBack, onSubmit }) {
-  const weekPlan = getWeekPlan(data, unit, bodyweight);
-  const weekDef = weekPlan.find((w) => w.week === data.week) || weekPlan[0];
-  const [weightUsed, setWeightUsed] = useState(String(weekDef.weight));
-  const [sets, setSets] = useState(String(weekDef.sets));
-  const [reps, setReps] = useState(String(weekDef.reps));
-  const [rpe, setRpe] = useState("");
-  const [notes, setNotes] = useState("");
-  const [setsChecked, setSetsChecked] = useState(() => Array(weekDef.sets).fill(false));
-  const [restTrigger, setRestTrigger] = useState(0);
+function SessionSetup({ name, data, unit, bodyweight, onBack, onContinue }) {
+  const oneRM = data ? data.oneRM || 0 : 0;
+  const [category, setCategory] = useState(null);
+  const [percent, setPercent] = useState(80);
+  const [weight, setWeight] = useState(percentToWeight(80, oneRM, unit));
 
-  const toggleSet = (idx) => {
-    setSetsChecked((prev) => {
-      const next = [...prev];
-      const wasChecked = next[idx];
-      next[idx] = !wasChecked;
-      if (!wasChecked && idx < next.length - 1) {
-        // just checked a set that isn't the last one — kick off rest
-        setRestTrigger((t) => t + 1);
-      }
-      return next;
-    });
+  if (!data) return null;
+
+  const pickCategory = (cat) => {
+    setCategory(cat.id);
+    const mid = categoryMidpoint(cat);
+    setPercent(mid);
+    setWeight(percentToWeight(mid, oneRM, unit));
+  };
+
+  const stepPercent = (delta) => {
+    setCategory(null);
+    const next = Math.max(0, Math.min(100, percent + delta));
+    setPercent(next);
+    setWeight(percentToWeight(next, oneRM, unit));
+  };
+
+  const onWeightChange = (v) => {
+    setCategory(null);
+    setWeight(v);
+    setPercent(weightToPercent(v, oneRM));
   };
 
   return (
     <div className="slf-fade">
-      <TopBar title={`Log · Week ${data.week}${weekDef.isDeload ? " (Deload)" : ""}`} onBack={onBack} />
+      <TopBar title={`Log · ${name}`} onBack={onBack} />
       <div className="slf-scroll">
-        <WarmupCard targetWeight={weekDef.weight} unit={unit} isBodyweight={data.isBodyweight} bodyweight={bodyweight} />
+        <span className="slf-label">Auto mode — pick a category</span>
+        <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+          {CATEGORIES.map((cat) => (
+            <button
+              key={cat.id}
+              className="slf-cat-chip"
+              style={{
+                borderColor: category === cat.id ? cat.color : "var(--border)",
+                background: category === cat.id ? "rgba(255,204,0,0.08)" : "transparent",
+              }}
+              onClick={() => pickCategory(cat)}
+            >
+              <div style={{ fontWeight: 700, fontSize: 13, color: category === cat.id ? cat.color : "var(--text)" }}>{cat.label}</div>
+              <div className="slf-mono" style={{ fontSize: 10, color: "var(--steel)", marginTop: 4 }}>
+                {cat.min}–{cat.max}%
+              </div>
+            </button>
+          ))}
+        </div>
+
+        <div className="slf-hero" style={{ padding: "24px 18px", textAlign: "center" }}>
+          <div className="slf-mono" style={{ fontSize: 11, color: "var(--steel)", marginBottom: 10 }}>
+            {category ? `${CATEGORIES.find((c) => c.id === category)?.label.toUpperCase()} · ` : "MANUAL · "}
+            % OF 1RM
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 18 }}>
+            <button className="slf-stepper-btn" onClick={() => stepPercent(-5)} aria-label="Decrease percent">
+              <Minus size={18} />
+            </button>
+            <div className="slf-display" style={{ fontSize: 44, minWidth: 110 }}>
+              {percent}%
+            </div>
+            <button className="slf-stepper-btn" onClick={() => stepPercent(5)} aria-label="Increase percent">
+              <Plus size={18} />
+            </button>
+          </div>
+          <div className="slf-mono" style={{ fontSize: 12, color: "var(--steel)", marginTop: 14 }}>
+            of {fmt(oneRM)} {unit} 1RM
+          </div>
+        </div>
+
+        <RepMaxTable data={data} bodyweight={bodyweight} unit={unit} activePercent={percent} />
+
+        <div className="slf-card" style={{ marginTop: 16 }}>
+          <span className="slf-label">Or set the added weight directly ({unit})</span>
+          <input
+            className="slf-input"
+            type="number"
+            inputMode="decimal"
+            value={weight}
+            onChange={(e) => onWeightChange(e.target.value)}
+          />
+          <p style={{ color: "var(--steel)", fontSize: 12, marginTop: 10, marginBottom: 0 }}>
+            Editing either the percentage or the weight updates the other — both are based on your current 1RM of {fmt(oneRM)} {unit}.
+          </p>
+        </div>
+
+        <button
+          className="slf-btn slf-btn-primary"
+          style={{ width: "100%", marginTop: 18 }}
+          onClick={() => onContinue({ category, percent, weight })}
+        >
+          Continue to log
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────────── Log Session ───────────────────────── */
+
+function LogSession({ name, data, unit, category, percent, weight, onBack, onSubmit }) {
+  const [weightUsed, setWeightUsed] = useState(String(fmt(weight)));
+  const [sets, setSets] = useState("5");
+  const [reps, setReps] = useState("5");
+  const [rpe, setRpe] = useState("");
+  const [notes, setNotes] = useState("");
+  const [setsChecked, setSetsChecked] = useState(() => Array(5).fill(false));
+
+  if (!data) return null;
+
+  const toggleSet = (idx) => {
+    setSetsChecked((prev) => {
+      const next = [...prev];
+      next[idx] = !next[idx];
+      return next;
+    });
+  };
+
+  const catInfo = CATEGORIES.find((c) => c.id === category);
+
+  return (
+    <div className="slf-fade">
+      <TopBar title={`Log · ${name}`} onBack={onBack} />
+      <div className="slf-scroll">
+        <WarmupCard targetWeight={Number(weightUsed)} unit={unit} isBodyweight={data.isBodyweight} />
 
         <div className="slf-card" style={{ marginBottom: 14 }}>
           <span className="slf-label" style={{ margin: 0, marginBottom: 10, display: "block" }}>
-            Sets · tap to check off
+            5 sets · tap to check off
           </span>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             {setsChecked.map((checked, idx) => (
@@ -2133,12 +2095,11 @@ function LogSession({ name, data, unit, bodyweight, restSeconds, onBack, onSubmi
           </div>
         </div>
 
-        <RestTimer defaultSeconds={restSeconds} triggerKey={restTrigger} />
-
         <div className="slf-card">
-          <div className="slf-mono" style={{ color: "var(--steel)", fontSize: 12, marginBottom: 16 }}>
-            {name.toUpperCase()} · BLOCK {data.block} · {weekDef.isDeload ? "DELOAD" : "PLANNED"} {weekDef.sets}×{weekDef.reps} @ {fmt(weekDef.weight)} {unit}
-            {data.isBodyweight ? " added" : ""}
+          <div className="slf-mono" style={{ color: "var(--steel)", fontSize: 12, marginBottom: 16, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span>{name.toUpperCase()}</span>
+            {catInfo && <span className="slf-chip gold">{catInfo.label}</span>}
+            {percent != null && <span className="slf-chip">{percent}% 1RM</span>}
           </div>
 
           <span className="slf-label">{data.isBodyweight ? `Added weight used (${unit})` : `Weight used (${unit})`}</span>
@@ -2171,9 +2132,20 @@ function LogSession({ name, data, unit, bodyweight, restSeconds, onBack, onSubmi
             className="slf-btn slf-btn-primary"
             style={{ width: "100%", marginTop: 18 }}
             disabled={!weightUsed || !sets || !reps}
-            onClick={() => onSubmit({ name, weightUsed, setsCompleted: sets, repsCompleted: reps, rpe, notes })}
+            onClick={() =>
+              onSubmit({
+                name,
+                category,
+                percent,
+                weightUsed,
+                setsCompleted: sets,
+                repsCompleted: reps,
+                rpe,
+                notes,
+              })
+            }
           >
-            {data.week === 4 ? "Log & complete wave" : "Log session"}
+            Log session
           </button>
         </div>
       </div>
@@ -2228,9 +2200,11 @@ function ExerciseHistoryList({ data, unit, onDeleteTest, onDeleteSession, onEdit
               </div>
             ) : (
               <div style={{ fontSize: 13, marginTop: 4 }}>
-                <span className="slf-chip" style={{ marginRight: 6 }}>
-                  wk {it.week}
-                </span>
+                {it.percent != null && (
+                  <span className="slf-chip" style={{ marginRight: 6 }}>
+                    {it.percent}%
+                  </span>
+                )}
                 {it.setsCompleted}×{it.repsCompleted} @ {fmt(it.weightUsed)} {unit}
                 {data.isBodyweight ? " added" : ""}
                 {it.rpe ? ` · RPE ${it.rpe}` : ""}
@@ -2478,61 +2452,12 @@ function StatsScreen({ exData, unit, bodyweight }) {
 
 /* ───────────────────────── Settings ───────────────────────── */
 
-function PctOverrideRow({ data, onSave }) {
-  const [wp, setWp] = useState(String(data.workingPct != null ? data.workingPct : DEFAULT_WORKING_PCT));
-  const [dp, setDp] = useState(String(data.deloadPct != null ? data.deloadPct : DEFAULT_DELOAD_PCT));
-
-  return (
-    <div style={{ marginTop: 4 }}>
-      <span className="slf-label">Working / deload %</span>
-      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-        <div style={{ flex: 1 }}>
-          <input
-            className="slf-input"
-            style={{ fontSize: 14, padding: 10 }}
-            type="number"
-            inputMode="numeric"
-            value={wp}
-            onChange={(e) => setWp(e.target.value)}
-            placeholder="80"
-          />
-        </div>
-        <div style={{ flex: 1 }}>
-          <input
-            className="slf-input"
-            style={{ fontSize: 14, padding: 10 }}
-            type="number"
-            inputMode="numeric"
-            value={dp}
-            onChange={(e) => setDp(e.target.value)}
-            placeholder="40"
-          />
-        </div>
-        <button
-          className="slf-btn slf-btn-teal"
-          style={{ padding: "10px 14px", fontSize: 12 }}
-          disabled={wp === "" || dp === ""}
-          onClick={() => onSave(wp, dp)}
-        >
-          Save
-        </button>
-      </div>
-      <p style={{ color: "var(--steel)", fontSize: 11, marginTop: -4, marginBottom: 4 }}>
-        Applied to this lift's added-weight 1RM, e.g. 70% working / 35% deload for a lighter wave than the 80%/40% default.
-      </p>
-    </div>
-  );
-}
-
 function SettingsScreen({
   config,
   exData,
   onSaveBodyweight,
-  onSaveRestSeconds,
   onToggleUnit,
   onFormulaOverride,
-  onWorkingPctOverride,
-  onRestartWave,
   onRemoveExercise,
   onAddExercise,
   onSaveReminderDays,
@@ -2540,7 +2465,6 @@ function SettingsScreen({
   onSaveUserName,
 }) {
   const [bw, setBw] = useState(config.bodyweight || "");
-  const [restSec, setRestSec] = useState(config.restSeconds || DEFAULT_REST_SECONDS);
   const [reminderDays, setReminderDays] = useState(config.reminderDays || DEFAULT_REMINDER_DAYS);
   const [name, setName] = useState(config.userName || "");
   const notifSupported = typeof Notification !== "undefined";
@@ -2571,37 +2495,6 @@ function SettingsScreen({
           <button className="slf-btn slf-btn-teal" onClick={() => onSaveBodyweight(bw)}>
             Save
           </button>
-        </div>
-
-        <span className="slf-label">Rest timer default</span>
-        <div className="slf-card" style={{ marginBottom: 20 }}>
-          <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
-            {[60, 90, 120, 180].map((s) => (
-              <button
-                key={s}
-                className="slf-btn"
-                style={{
-                  padding: "8px 14px",
-                  fontSize: 12,
-                  background: Number(restSec) === s ? "var(--gold)" : "transparent",
-                  color: Number(restSec) === s ? "#151310" : "var(--text)",
-                  border: "1px solid var(--border)",
-                }}
-                onClick={() => setRestSec(s)}
-              >
-                {s}s
-              </button>
-            ))}
-          </div>
-          <div style={{ display: "flex", gap: 10 }}>
-            <input className="slf-input" type="number" value={restSec} onChange={(e) => setRestSec(e.target.value)} />
-            <button className="slf-btn slf-btn-teal" onClick={() => onSaveRestSeconds(restSec)}>
-              Save
-            </button>
-          </div>
-          <p style={{ color: "var(--steel)", fontSize: 12, marginTop: 10, marginBottom: 0 }}>
-            Auto-starts after you check off a set while logging. Adjustable ±15s in the moment too.
-          </p>
         </div>
 
         <span className="slf-label">Units</span>
@@ -2677,7 +2570,7 @@ function SettingsScreen({
             <span className="slf-label">1RM formula</span>
             <select
               className="slf-input"
-              style={{ fontFamily: "Inter", fontSize: 13, marginBottom: 12 }}
+              style={{ fontFamily: "Inter", fontSize: 13 }}
               value={exData[n].formula}
               onChange={(e) => onFormulaOverride(n, e.target.value)}
             >
@@ -2688,10 +2581,6 @@ function SettingsScreen({
                 </option>
               ))}
             </select>
-            <PctOverrideRow data={exData[n]} onSave={(wp, dp) => onWorkingPctOverride(n, wp, dp)} />
-            <button className="slf-btn slf-btn-ghost" style={{ width: "100%", fontSize: 12, marginTop: 10 }} onClick={() => onRestartWave(n)}>
-              Restart current wave (week 1)
-            </button>
           </div>
         ))}
 
@@ -2717,11 +2606,12 @@ function BottomNav({ screen, onNav }) {
     { id: "history", label: "History", icon: HistoryIcon },
     { id: "settings", label: "Settings", icon: SettingsIcon },
   ];
+  const LOG_GROUP = ["logPicker", "sessionSetup", "logSession"];
   return (
     <nav className="slf-navbar">
       {items.map((it) => {
         const Icon = it.icon;
-        const active = screen === it.id || (it.id === "logPicker" && screen === "logSession");
+        const active = it.id === "logPicker" ? LOG_GROUP.includes(screen) : screen === it.id;
         return (
           <button key={it.id} className={`slf-navitem ${active ? "active" : ""}`} onClick={() => onNav(it.id)}>
             <Icon size={19} />
